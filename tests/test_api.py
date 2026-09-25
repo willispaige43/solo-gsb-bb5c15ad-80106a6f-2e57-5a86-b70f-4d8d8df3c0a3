@@ -1174,3 +1174,195 @@ def test_observations_naive_datetime_treated_as_utc(client):
         json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
     ).json()
     assert body["earliest_departure"] == "2026-09-24T01:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# 实测潮高异常点质检 GET /ports/{id}/observation-anomalies
+# ---------------------------------------------------------------------------
+
+
+def _setup_flat_zero_port(client, end="2026-09-24T08:00:00Z"):
+    """平潮预报恒 0.0：残差即实测潮高，便于直接核对阈值。"""
+    r = client.post("/ports", json={"name": "质检港", "reference_depth": 4.0})
+    port_id = r.json()["id"]
+    r = client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 0.0},
+            {"forecast_time": end, "tide_height": 0.0},
+        ]},
+    )
+    assert r.status_code == 200
+    return port_id
+
+
+def test_observation_anomalies_detects_spike_and_returns_fields(client):
+    port_id = _setup_flat_zero_port(client)
+    # 00:00–06:00 每小时一条实测，残差为 0，03:00 尖峰 +1.0
+    points = [
+        {"obs_time": f"2026-09-24T{h:02d}:00:00Z",
+         "tide_height": 1.0 if h == 3 else 0.0}
+        for h in range(0, 7)
+    ]
+    assert _put_observations(client, port_id, points).status_code == 200
+
+    r = client.get(f"/ports/{port_id}/observation-anomalies")
+    assert r.status_code == 200
+    assert r.json() == [
+        {
+            "obs_time": "2026-09-24T03:00:00+00:00",
+            "tide_height": 1.0,
+            "residual": 1.0,
+            "baseline": 0.0,
+            "deviation": 1.0,
+        }
+    ]
+
+
+def test_observation_anomalies_sorted_ascending_and_negative_spike(client):
+    port_id = _setup_flat_zero_port(client, end="2026-09-24T10:00:00Z")
+    points = [
+        {"obs_time": f"2026-09-24T{h:02d}:00:00Z",
+         "tide_height": 1.0 if h == 3 else -1.0 if h == 7 else 0.0}
+        for h in range(0, 11)
+    ]
+    _put_observations(client, port_id, points)
+    body = client.get(f"/ports/{port_id}/observation-anomalies").json()
+    assert [a["obs_time"] for a in body] == [
+        "2026-09-24T03:00:00+00:00",
+        "2026-09-24T07:00:00+00:00",
+    ]
+    assert body[1]["residual"] == -1.0
+    assert body[1]["deviation"] == 1.0
+
+
+def test_observation_anomalies_strict_floor_threshold(client):
+    port_id = _setup_flat_zero_port(client)
+    base = [
+        {"obs_time": f"2026-09-24T{h:02d}:00:00Z", "tide_height": 0.0}
+        for h in (1, 2, 4, 5)
+    ]
+    # 偏离恰为 0.3 米（阈值下限）：严格超过才判异 → 空列表
+    _put_observations(client, port_id, base + [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 0.3},
+    ])
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+
+    # 覆盖写为 0.3001：严格超过 0.3 → 判异
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 0.3001},
+    ])
+    body = client.get(f"/ports/{port_id}/observation-anomalies").json()
+    assert len(body) == 1
+    assert body[0]["obs_time"] == "2026-09-24T03:00:00+00:00"
+    assert body[0]["deviation"] == pytest.approx(0.3001)
+
+
+def test_observation_anomalies_insufficient_neighbors_empty(client):
+    port_id = _setup_flat_zero_port(client)
+    # 仅 3 条实测：每条自身之外至多 2 个邻点 → 不评估，返回空
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 0.0},
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T04:00:00Z", "tide_height": 0.0},
+    ])
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+
+
+def test_observation_anomalies_fewer_than_two_forecasts_empty(client):
+    r = client.post("/ports", json={"name": "无预报港", "reference_depth": 4.0})
+    port_id = r.json()["id"]
+    _put_observations(client, port_id, [
+        {"obs_time": f"2026-09-24T{h:02d}:00:00Z", "tide_height": 0.0}
+        for h in range(0, 6)
+    ])
+    # 无预报点
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+    # 仅 1 个预报点（不足两预报点，无插值区间）
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 0.0}]},
+    )
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+
+
+def test_observation_anomalies_ignore_observations_outside_coverage(client):
+    # 预报只覆盖 [02:00, 06:00]：覆盖外的 01:00/07:00 不参与，
+    # 04:00 尖峰在覆盖内邻点不足 3 个（仅 03:00/05:00）→ 空
+    r = client.post("/ports", json={"name": "窄覆盖港", "reference_depth": 4.0})
+    port_id = r.json()["id"]
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": "2026-09-24T02:00:00Z", "tide_height": 0.0},
+            {"forecast_time": "2026-09-24T06:00:00Z", "tide_height": 0.0},
+        ]},
+    )
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T01:00:00Z", "tide_height": 0.0},
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 0.0},
+        {"obs_time": "2026-09-24T04:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T05:00:00Z", "tide_height": 0.0},
+        {"obs_time": "2026-09-24T07:00:00Z", "tide_height": 0.0},
+    ])
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+
+    # 补上边界点 02:00（含端点覆盖）后邻点达 3 个 → 尖峰判异
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 0.0},
+    ])
+    body = client.get(f"/ports/{port_id}/observation-anomalies").json()
+    assert [a["obs_time"] for a in body] == ["2026-09-24T04:00:00+00:00"]
+    assert body[0]["residual"] == 1.0
+
+
+def test_observation_anomalies_query_is_read_only(client):
+    port_id = _setup_flat_zero_port(client)
+    # 平潮水深恒 4.0：吃水 3.0 + 富余 0.5 = 3.5 全程达标，可 00:00 出发
+    rid = client.post(
+        f"/ports/{port_id}/reservations",
+        json={
+            "ship_name": "检验船",
+            "draft": 3.0,
+            "safety_margin": 0.5,
+            "duration_minutes": 60,
+            "allowed_departure_from": "2026-09-24T00:00:00Z",
+            "allowed_departure_to": "2026-09-24T08:00:00Z",
+        },
+    ).json()["id"]
+    # 00:00–06:00 整点实测，残差为 0，03:00 尖峰 +1.0
+    _put_observations(client, port_id, [
+        {"obs_time": f"2026-09-24T{h:02d}:00:00Z",
+         "tide_height": 1.0 if h == 3 else 0.0}
+        for h in range(0, 7)
+    ])
+
+    anomalies = client.get(f"/ports/{port_id}/observation-anomalies").json()
+    assert [a["obs_time"] for a in anomalies] == ["2026-09-24T03:00:00+00:00"]
+    assert anomalies[0]["tide_height"] == 1.0
+    assert anomalies[0]["residual"] == 1.0
+
+    # 只读：库存预报、实测点均不变
+    forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
+    assert [f["tide_height"] for f in forecasts] == [0.0, 0.0]
+    observations = client.get(f"/ports/{port_id}/tide-observations").json()
+    assert [o["tide_height"] for o in observations] == [
+        0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+    ]
+    # 预约排程不受质检影响（预约始终按原预报）
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == rid
+    assert listed[0]["departure_start"] == "2026-09-24T00:00:00+00:00"
+    assert listed[0]["departure_end"] == "2026-09-24T01:00:00+00:00"
+    audit = client.get(f"/reservations/{rid}/depth-audit").json()
+    assert audit["sufficient"] is True
+    # 校准窗口与原窗口查询结果也不因子查询而改变
+    body = {"draft": 3.0, "safety_margin": 0.5, "duration_minutes": 60}
+    for path in ("/windows", "/calibrated-windows"):
+        result = client.post(f"/ports/{port_id}{path}", json=body).json()
+        assert result["earliest_departure"] == "2026-09-24T00:00:00+00:00"
+
+
+def test_observation_anomalies_unknown_port_404(client):
+    assert client.get("/ports/999/observation-anomalies").status_code == 404

@@ -31,6 +31,12 @@
   覆盖范围内的观测，以预报首末时刻的零残差为边界锚点（同刻观测优先），
   锚点间线性插值残差并叠加原预报，把预报点与有效观测点时刻合并为折点后
   复用现有通航窗口计算；无有效观测时等同原窗口；查询只读，不改原预报和预约。
+- 实测潮高异常点质检：GET /ports/{id}/observation-anomalies 对落在最新预报
+  覆盖内的每条实测记录按预报线性插值求残差，以该时刻前后各 120 分钟内其他
+  有效实测残差的中位数为局部基线（至少 3 个邻点才评估）；局部 MAD 为邻点
+  残差与基线差的绝对值中位数，阈值取 max(0.3 米, 3×1.4826×MAD)；仅返回
+  残差偏离基线严格超过阈值的点（时刻、实测潮高、残差、基线、偏离量，按时刻
+  升序）；不足两预报点或无足够邻点返回空列表；查询只读，不影响校准窗口及预约。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -49,6 +55,7 @@ from .schemas import (
     ForecastImpactPreview,
     MaxDraftQuery,
     MaxDraftResult,
+    ObservationAnomaly,
     PortCreate,
     PortOut,
     PortUpdate,
@@ -70,6 +77,7 @@ from .tides import (
     earliest_scheduled_departure,
     max_supported_required_depth,
     merge_forecast_points,
+    observation_anomalies,
 )
 
 @asynccontextmanager
@@ -80,7 +88,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -231,6 +239,38 @@ def upsert_tide_observations(
 def get_tide_observations(port_id: int, db: Connection = Depends(get_db)):
     _get_port_or_404(db, port_id)
     return _list_observations(db, port_id)
+
+
+@app.get(
+    "/ports/{port_id}/observation-anomalies",
+    response_model=list[ObservationAnomaly],
+)
+def get_observation_anomalies(port_id: int, db: Connection = Depends(get_db)):
+    """实测潮高异常点质检（只读，不影响校准窗口及预约）。
+
+    对落在该港口**最新预报覆盖范围** [首预报时刻, 末预报时刻] 内的每条实测
+    记录，按相邻预报点线性插值求预报潮高，残差 = 实测 − 预报；以该时刻
+    **前后各 120 分钟（含）**内其他有效实测残差的中位数为局部基线，邻点
+    **至少 3 个**才评估；局部 MAD 为邻点残差与基线之差绝对值的中位数，
+    异常阈值取 max(0.3 米, 3 × 1.4826 × MAD)。仅返回残差偏离基线**严格**
+    超过阈值的点，含时刻、实测潮高、残差、基线与偏离量，按时刻升序。
+    预报不足 2 点或无足够邻点时返回空列表。
+    """
+    _get_port_or_404(db, port_id)
+    anomalies = observation_anomalies(
+        _forecast_points(db, port_id),
+        _observation_points(db, port_id),
+    )
+    return [
+        ObservationAnomaly(
+            obs_time=t,
+            tide_height=observed,
+            residual=residual,
+            baseline=baseline,
+            deviation=deviation,
+        )
+        for t, observed, residual, baseline, deviation in anomalies
+    ]
 
 
 def _list_observations(db: Connection, port_id: int) -> list[TideObservationOut]:

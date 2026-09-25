@@ -64,6 +64,20 @@ class TideObservationOut(BaseModel):
     tide_height: float
 
 
+class ObservationAnomaly(BaseModel):
+    """一条实测潮高异常点：残差相对局部基线的偏离严格超过阈值。"""
+
+    obs_time: UtcDatetime = Field(description="实测时刻")
+    tide_height: float = Field(description="实测潮高（米，相对海图基准面）")
+    residual: float = Field(description="残差（米）= 实测潮高 − 观测时刻线性插值预报潮高")
+    baseline: float = Field(
+        description="局部基线（米）= 前后各 120 分钟内其他有效实测残差的中位数"
+    )
+    deviation: float = Field(
+        description="偏离量（米）= |残差 − 基线|，严格超过 max(0.3, 3×1.4826×MAD) 才返回"
+    )
+
+
 class WindowQuery(BaseModel):
     draft: float = Field(ge=0, description="船舶吃水（米）")
     safety_margin: float = Field(ge=0, description="安全富余（米）")
