@@ -40,6 +40,13 @@
   预报首末时刻的**零残差**为边界锚点（同刻有观测则**观测优先**），锚点间**线性
   插值残差**并叠加原预报；把预报点与有效观测点时刻合并为折点后**复用现有通航窗口
   计算**；无有效观测时等同原窗口。校准查询**只读**，不改原预报和预约。
+- **实测潮高异常点质检**：`GET /ports/{id}/observation-anomalies` 对落在**最新预报
+  覆盖**内的每条实测记录，按预报**线性插值求残差**；以该时刻**前后各 120 分钟**内
+  其他有效实测残差的**中位数**作局部基线（**至少 3 个邻点**才评估），局部 **MAD**
+  为邻点残差与基线差的绝对值中位数，异常阈值取 **max(0.3 米, 3×1.4826×MAD)**；
+  仅返回残差偏离基线**严格超过阈值**的点（含时刻、实测潮高、残差、基线与偏离量，
+  按时刻升序）；预报不足两点或无足够邻点返回空列表。查询**只读**，不影响校准窗口
+  及预约。
 
 ## 快速开始（单条命令）
 
@@ -81,6 +88,7 @@ docker compose up --build
 | `GET` | `/ports/{id}/tide-observations` | 查看已写入的实测潮高点 |
 | `POST` | `/ports/{id}/windows` | 提交吃水、安全富余、通航时长，计算可出发时段 |
 | `POST` | `/ports/{id}/calibrated-windows` | 实测潮位校准窗口：请求/响应同 `/windows`，按实测残差校准后计算（只读） |
+| `GET` | `/ports/{id}/observation-anomalies` | 实测潮高异常点质检：局部中位数 + MAD 阈值识别异常实测点（只读） |
 | `POST` | `/ports/{id}/max-draft` | 提交安全富余、通航时长、允许出发起止，求最大可通航吃水 |
 | `POST` | `/ports/{id}/reservations` | 创建单向航道预约（自动排最早出发时刻） |
 | `GET` | `/ports/{id}/reservations` | 按港口列出**有效**预约（按出发时刻升序） |
@@ -547,6 +555,72 @@ curl -X PUT http://localhost:8000/ports/1/tide-observations \
   预报点；`/windows`、预约排程与水深复核均继续使用原预报；
 - 预报更正后再次查询校准窗口，残差会按**更正后的最新预报**重新计算。
 
+## 实测潮高异常点质检
+
+`GET /ports/{id}/observation-anomalies`（服务默认监听 **8000** 端口，即
+`http://localhost:8000/ports/{id}/observation-anomalies`）对已写入的实测潮高做
+**只读**异常点质检，辅助发现潮位站的粗差数据：
+
+1. 读取该港口**最新预报**与全部实测点；对每条落在预报覆盖范围
+   **[首预报时刻, 末预报时刻]** 内的实测记录，用相邻预报点**线性插值**得到该
+   时刻的预报潮高，**残差 = 实测潮高 − 预报潮高**；范围外的实测记录不参与评估；
+2. 取该实测时刻**前后各 120 分钟**（即 `[t−120min, t+120min]`，含恰好 120
+   分钟）内的**其他**有效实测记录作为邻点（该点自身不计入），邻点**不足 3 个**
+   时该点不评估；
+3. **局部基线** = 邻点残差的**中位数**；**局部 MAD** = 邻点残差与基线之差的
+   绝对值的中位数；异常阈值 = **max(0.3 米, 3 × 1.4826 × MAD)**；
+4. 当且仅当残差偏离基线的绝对值（**偏离量**）**严格大于**阈值时判为异常
+   （恰好等于阈值不返回）；
+5. 结果按实测时刻**升序**返回，每条含 `obs_time`（时刻）、`tide_height`
+   （实测潮高）、`residual`（残差）、`baseline`（局部基线）、`deviation`
+   （偏离量）；**预报不足 2 个点**或**所有点都没有足够邻点**时返回空列表 `[]`。
+
+质检**只读**：不写库、不改动实测点与预报点，**不影响校准窗口**及任何预约排程；
+港口不存在返回 404。
+
+```bash
+# 新港口：基准水深 4.0 米，预报恒为 1.0 米（00:00–06:00 每小时一个点）
+curl -X POST http://localhost:8000/ports \
+  -H "Content-Type: application/json" \
+  -d '{"name": "质检港", "reference_depth": 4.0}'
+
+for h in 00 01 02 03 04 05 06; do
+  curl -X PUT http://localhost:8000/ports/2/tide-forecasts \
+    -H "Content-Type: application/json" \
+    -d "{\"points\": [{\"forecast_time\": \"2026-09-24T${h}:00:00Z\", \"tide_height\": 1.0}]}"
+done
+
+# 写入实测：多数点贴合预报，02:00 出现 +0.5 米的突跳（粗差）
+curl -X PUT http://localhost:8000/ports/2/tide-observations \
+  -H "Content-Type: application/json" \
+  -d '{"points": [
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T01:00:00Z", "tide_height": 1.05},
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 1.5},
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 0.95},
+        {"obs_time": "2026-09-24T04:00:00Z", "tide_height": 1.0}
+      ]}'
+
+# 质检：02:00 的邻点残差中位数（基线）为 0，偏离量 0.5 > 阈值 0.3 → 唯一异常点
+curl http://localhost:8000/ports/2/observation-anomalies
+```
+
+响应（按时刻升序）：
+
+```json
+[
+  {
+    "obs_time": "2026-09-24T02:00:00+00:00",
+    "tide_height": 1.5,
+    "residual": 0.5,
+    "baseline": 0.0,
+    "deviation": 0.5
+  }
+]
+```
+
+无异常点、预报不足两点或没有任何实测点拥有 3 个以上邻点时返回 `[]`。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -561,7 +635,7 @@ pytest                                # 运行全部测试（核心算法 + API 
 ```
 app/
   main.py       # FastAPI 路由与生命周期（启动时初始化数据库）
-  tides.py      # 核心算法：线性插值、达标窗口、可出发时段、水深复核、最大可通航吃水、预报合并、实测残差校准
+  tides.py      # 核心算法：线性插值、达标窗口、可出发时段、水深复核、最大可通航吃水、预报合并、实测残差校准、实测异常点质检
   database.py   # SQLite 连接与幂等建表
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

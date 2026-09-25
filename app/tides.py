@@ -17,13 +17,25 @@
   线性插值预报），以预报首末时刻的零残差为边界锚点（同刻有观测则以观测为准），
   锚点间线性插值残差并叠加原预报；把预报点与有效观测点时刻合并为折点后，
   即可复用现有通航窗口计算（纯内存计算，不改原预报）。
+- 实测潮高异常点质检：对落在预报覆盖内的每条实测记录按线性插值预报求残差，
+  以该时刻前后各 120 分钟内其他有效实测残差的中位数为局部基线（至少 3 个邻点
+  才评估），局部 MAD 为邻点残差与基线差的绝对值中位数，异常阈值取
+  max(0.3 米, 3×1.4826×MAD)，仅返回偏离量严格超过阈值的点。
 """
 from __future__ import annotations
 
 from bisect import bisect_right
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from statistics import median
 
 _EPS = 1e-9  # 浮点容差，保证“恰好达标”的端点被纳入
+
+# 实测潮高异常点质检参数
+_ANOMALY_WINDOW = timedelta(minutes=120)  # 局部邻域：前后各 120 分钟（含恰好 120 分钟）
+_ANOMALY_MIN_NEIGHBORS = 3                # 至少 3 个邻点才评估该点
+_ANOMALY_MIN_THRESHOLD_M = 0.3            # 异常阈值下限（米）
+_ANOMALY_MAD_FACTOR = 1.4826              # MAD → 正态分布标准差的一致估计系数
+_ANOMALY_SIGMA = 3.0                      # 阈值取 3 倍（稳健）标准差
 
 ForecastPoint = tuple[datetime, float]  # (预报时刻, 潮高)
 
@@ -312,6 +324,73 @@ def calibrated_forecast_points(
         result.append((t, observed_height))
     result.sort(key=lambda p: p[0])
     return result
+
+
+def observation_anomalies(
+    forecast: list[ForecastPoint],
+    observations: list[ForecastPoint],
+) -> list[tuple[datetime, float, float, float, float]]:
+    """实测潮高异常点质检（纯内存，只读计算）。
+
+    对每条落在最新预报覆盖范围 [首预报时刻, 末预报时刻] 内的实测记录：
+    - 残差 = 实测潮高 − 观测时刻按相邻预报点线性插值的预报潮高；
+    - 局部邻点 = 与该时刻相差不超过 120 分钟（前后各 120 分钟，含恰好
+      120 分钟）的**其他**有效实测记录（该点自身不计入）；邻点不足 3 个
+      时不评估该点；
+    - 局部基线 = 邻点残差的中位数；局部 MAD = 邻点残差与基线之差的绝对值
+      的中位数；异常阈值 = max(0.3 米, 3 × 1.4826 × MAD)；
+    - 仅当残差偏离基线的绝对值**严格大于**阈值时判为异常。
+
+    返回按时刻升序的 (时刻, 实测潮高, 残差, 局部基线, 偏离量) 列表；
+    偏离量 = |残差 − 基线|。预报不足 2 点（无插值区间）或没有任何点
+    拥有足够邻点时返回空列表。
+    """
+    if len(forecast) < 2:
+        return []
+
+    first_t, last_t = forecast[0][0], forecast[-1][0]
+
+    # 有效实测：落在预报覆盖范围内（含边界），同刻重复以最后一条为准
+    valid: dict[datetime, float] = {}
+    for t, observed in observations:
+        if first_t <= t <= last_t:
+            valid[t] = observed
+
+    # (时刻, 实测潮高, 残差)，按时刻升序
+    residuals: list[tuple[datetime, float, float]] = [
+        (t, h, h - _piecewise_linear(forecast, t)) for t, h in sorted(valid.items())
+    ]
+
+    anomalies: list[tuple[datetime, float, float, float, float]] = []
+    for t, observed, residual in residuals:
+        lo, hi = t - _ANOMALY_WINDOW, t + _ANOMALY_WINDOW
+        # 邻点为时间窗内的其他有效实测（不含该点自身）
+        neighbor_residuals = [
+            r for ot, _, r in residuals if ot != t and lo <= ot <= hi
+        ]
+        if len(neighbor_residuals) < _ANOMALY_MIN_NEIGHBORS:
+            continue
+        baseline = median(neighbor_residuals)
+        deviations = [abs(r - baseline) for r in neighbor_residuals]
+        local_mad = median(deviations)
+        threshold = max(
+            _ANOMALY_MIN_THRESHOLD_M,
+            _ANOMALY_SIGMA * _ANOMALY_MAD_FACTOR * local_mad,
+        )
+        deviation = abs(residual - baseline)
+        # 严格“超过”才判异常：恰好落在阈值上（含二进制浮点噪声）不返回，
+        # 与窗口计算“端点恰好达标也纳入”同样以 _EPS 消除浮点抖动
+        if deviation > threshold + _EPS:
+            anomalies.append(
+                (
+                    t,
+                    observed,
+                    round(residual, 6),
+                    round(baseline, 6),
+                    round(deviation, 6),
+                )
+            )
+    return anomalies
 
 
 def depth_deficit_audit(

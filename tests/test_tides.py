@@ -9,6 +9,7 @@ from app.tides import (
     earliest_scheduled_departure,
     max_supported_required_depth,
     merge_forecast_points,
+    observation_anomalies,
     sufficient_depth_windows,
 )
 
@@ -544,3 +545,154 @@ def test_calibration_two_observations_residual_piecewise_linear():
     assert len(windows) == 1
     assert windows[0][0] == BASE.timestamp()
     assert windows[0][1] == (BASE + timedelta(hours=2)).timestamp()
+
+
+# ---------------------------------------------------------------------------
+# observation_anomalies：实测潮高异常点质检
+# ---------------------------------------------------------------------------
+
+
+def test_anomalies_detects_spike_against_local_median():
+    # 平潮预报恒 1.0（00–06 每小时一点）；实测 00/01/02/03/04 时，
+    # 残差 0, +0.05, +0.5, -0.05, 0；02:00 突跳 +0.5，4 个邻点
+    # （00:00–04:00 均在前后 120 分钟内），基线 0、MAD 0.025，
+    # 3×1.4826×MAD ≈ 0.111 < 0.3 → 阈值 0.3，偏离 0.5 为唯一异常点
+    forecast = pts(*([1.0] * 7))
+    observations = [
+        (BASE + timedelta(hours=h), v)
+        for h, v in [(0, 1.0), (1, 1.05), (2, 1.5), (3, 0.95), (4, 1.0)]
+    ]
+    anomalies = observation_anomalies(forecast, observations)
+    assert anomalies == [
+        (BASE + timedelta(hours=2), 1.5, 0.5, 0.0, 0.5)
+    ]
+
+
+def test_anomalies_returns_empty_without_enough_forecast_points():
+    # 预报不足 2 点（无插值区间）→ 空列表
+    assert observation_anomalies([], [(BASE, 9.9)]) == []
+    one = [(BASE, 1.0)]
+    assert observation_anomalies(one, [(BASE, 1.0), (BASE, 1.5)]) == []
+
+
+def test_anomalies_requires_at_least_three_neighbors():
+    # 平潮预报恒 1.0；只有 3 个实测点时，每个点最多有 2 个邻点 → 全部不评估
+    forecast = pts(*([1.0] * 5))
+    observations = [
+        (BASE, 1.0),
+        (BASE + timedelta(hours=1), 1.5),
+        (BASE + timedelta(hours=2), 1.0),
+    ]
+    assert observation_anomalies(forecast, observations) == []
+
+
+def test_anomalies_three_neighbors_is_enough():
+    # 4 个实测点：中间点各有 3 个邻点；01:00 突跳 +0.5，
+    # 邻点为 00/02/03 时，残差 0,0,0 → 基线 0、偏离 0.5 → 异常
+    forecast = pts(*([1.0] * 5))
+    observations = [
+        (BASE, 1.0),
+        (BASE + timedelta(hours=1), 1.5),
+        (BASE + timedelta(hours=2), 1.0),
+        (BASE + timedelta(hours=3), 1.0),
+    ]
+    anomalies = observation_anomalies(forecast, observations)
+    assert anomalies == [
+        (BASE + timedelta(hours=1), 1.5, 0.5, 0.0, 0.5)
+    ]
+
+
+def test_anomalies_strict_greater_than_threshold():
+    # 5 个实测点，仅 02:00 的残差为 +0.3（恰好等于阈值下限 0.3）：
+    # 严格“超过”才返回 → 空列表
+    forecast = pts(*([1.0] * 7))
+    observations = [
+        (BASE + timedelta(hours=h), v)
+        for h, v in [(0, 1.0), (1, 1.0), (2, 1.3), (3, 1.0), (4, 1.0)]
+    ]
+    assert observation_anomalies(forecast, observations) == []
+
+
+def test_anomalies_mad_threshold_can_exceed_floor():
+    # 02:00 的邻点（01/03/04 时）残差为 -0.2, +0.2, 0：基线 0、MAD 0.2，
+    # 3×1.4826×MAD ≈ 0.889 > 0.3 → 偏离 0.5 不判异常，偏离 1.0 才异常
+    forecast = pts(*([1.0] * 7))
+    base_obs = [
+        (BASE + timedelta(hours=1), 0.8),
+        (BASE + timedelta(hours=3), 1.2),
+        (BASE + timedelta(hours=4), 1.0),
+    ]
+    moderate = base_obs + [(BASE + timedelta(hours=2), 1.5)]
+    assert observation_anomalies(forecast, moderate) == []
+
+    severe = base_obs + [(BASE + timedelta(hours=2), 2.0)]
+    anomalies = observation_anomalies(forecast, severe)
+    assert anomalies == [
+        (BASE + timedelta(hours=2), 2.0, 1.0, 0.0, 1.0)
+    ]
+
+
+def test_anomalies_window_boundary_minutes_inclusive():
+    # 03:00 的邻点恰落在 ±120 分钟（01:00、05:00）处：端点计入才凑够
+    # 4 个邻点（01/02/04/05）；若端点不计入则只有 2 个邻点、无法评估
+    forecast = pts(*([1.0] * 7))
+    observations = [
+        (BASE + timedelta(hours=1), 1.0),
+        (BASE + timedelta(hours=2), 1.0),
+        (BASE + timedelta(hours=3), 1.5),
+        (BASE + timedelta(hours=4), 1.0),
+        (BASE + timedelta(hours=5), 1.0),
+    ]
+    anomalies = observation_anomalies(forecast, observations)
+    assert anomalies == [
+        (BASE + timedelta(hours=3), 1.5, 0.5, 0.0, 0.5)
+    ]
+
+
+def test_anomalies_residual_uses_interpolated_forecast():
+    # 线性预报 0.0→2.0（00:00–04:00）；02:00 插值预报 1.0，
+    # 实测 1.5 → 残差 +0.5；其余实测贴合预报
+    forecast = [
+        (BASE, 0.0),
+        (BASE + timedelta(hours=4), 2.0),
+    ]
+    observations = [
+        (BASE, 0.0),
+        (BASE + timedelta(hours=1), 0.5),
+        (BASE + timedelta(hours=2), 1.5),
+        (BASE + timedelta(hours=3), 1.5),
+        (BASE + timedelta(hours=4), 2.0),
+    ]
+    anomalies = observation_anomalies(forecast, observations)
+    assert anomalies == [
+        (BASE + timedelta(hours=2), 1.5, 0.5, 0.0, 0.5)
+    ]
+
+
+def test_anomalies_ignores_observations_outside_coverage():
+    # 覆盖外的粗差不参与：00–04 时内仅有 3 个实测，均不足 3 邻点 → 空
+    forecast = pts(*([1.0] * 5))
+    observations = [
+        (BASE - timedelta(hours=1), 9.9),            # 覆盖范围外
+        (BASE, 1.0),
+        (BASE + timedelta(hours=1), 1.0),
+        (BASE + timedelta(hours=2), 1.0),
+        (BASE + timedelta(hours=5), 9.9),            # 覆盖范围外
+    ]
+    assert observation_anomalies(forecast, observations) == []
+
+
+def test_anomalies_sorted_by_time_and_read_only():
+    # 乱序传入，结果按时刻升序；入参不被修改
+    forecast = pts(*([1.0] * 7))
+    observations = [
+        (BASE + timedelta(hours=4), 1.0),
+        (BASE + timedelta(hours=1), 1.05),
+        (BASE + timedelta(hours=3), 0.95),
+        (BASE + timedelta(hours=2), 1.5),
+        (BASE + timedelta(hours=0), 1.0),
+    ]
+    snapshot = list(observations)
+    anomalies = observation_anomalies(forecast, observations)
+    assert [a[0] for a in anomalies] == [BASE + timedelta(hours=2)]
+    assert observations == snapshot

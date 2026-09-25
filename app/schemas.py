@@ -64,6 +64,18 @@ class TideObservationOut(BaseModel):
     tide_height: float
 
 
+class ObservationAnomaly(BaseModel):
+    """实测潮高异常点质检结果中的一条异常记录。"""
+
+    obs_time: UtcDatetime = Field(description="实测时刻")
+    tide_height: float = Field(description="实测潮高（米）")
+    residual: float = Field(description="残差（米）= 实测潮高 − 该时刻线性插值预报潮高")
+    baseline: float = Field(
+        description="局部基线（米）= 前后各 120 分钟内其他有效实测残差的中位数"
+    )
+    deviation: float = Field(description="偏离量（米）= |残差 − 局部基线|")
+
+
 class WindowQuery(BaseModel):
     draft: float = Field(ge=0, description="船舶吃水（米）")
     safety_margin: float = Field(ge=0, description="安全富余（米）")

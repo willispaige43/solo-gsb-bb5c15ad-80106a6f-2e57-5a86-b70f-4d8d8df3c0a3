@@ -1174,3 +1174,154 @@ def test_observations_naive_datetime_treated_as_utc(client):
         json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
     ).json()
     assert body["earliest_departure"] == "2026-09-24T01:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# 实测潮高异常点质检：GET /ports/{id}/observation-anomalies
+# ---------------------------------------------------------------------------
+
+
+def _setup_flat_port(client, hours=range(7)):
+    """平潮预报恒 1.0（00:00 起每小时一个点），返回新港口 id。"""
+    r = client.post("/ports", json={"name": "质检港", "reference_depth": 4.0})
+    port_id = r.json()["id"]
+    r = client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": f"2026-09-24T{h:02d}:00:00Z", "tide_height": 1.0}
+            for h in hours
+        ]},
+    )
+    assert r.status_code == 200
+    return port_id
+
+
+def test_observation_anomalies_detects_spike(client):
+    port_id = _setup_flat_port(client)
+    # 残差 0, +0.05, +0.5, -0.05, 0：02:00 突跳为唯一异常点
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T01:00:00Z", "tide_height": 1.05},
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 1.5},
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 0.95},
+        {"obs_time": "2026-09-24T04:00:00Z", "tide_height": 1.0},
+    ])
+    r = client.get(f"/ports/{port_id}/observation-anomalies")
+    assert r.status_code == 200
+    assert r.json() == [
+        {
+            "obs_time": "2026-09-24T02:00:00+00:00",
+            "tide_height": 1.5,
+            "residual": 0.5,
+            "baseline": 0.0,
+            "deviation": 0.5,
+        }
+    ]
+
+
+def test_observation_anomalies_none_returns_empty(client):
+    port_id = _setup_flat_port(client)
+    # 未写入任何实测点
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+    # 实测贴合预报：无异常
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T01:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 1.0},
+    ])
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+
+
+def test_observation_anomalies_insufficient_forecast_points(client):
+    # 仅 1 个预报点：无插值区间 → 空列表
+    r = client.post("/ports", json={"name": "单点港", "reference_depth": 4.0})
+    port_id = r.json()["id"]
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+        ]},
+    )
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 9.9},
+        {"obs_time": "2026-09-24T01:00:00Z", "tide_height": 9.9},
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 9.9},
+    ])
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+
+
+def test_observation_anomalies_too_few_neighbors(client):
+    port_id = _setup_flat_port(client)
+    # 只有 3 个实测点：每个点最多 2 个邻点 → 全部不评估，空列表
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T01:00:00Z", "tide_height": 1.5},
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 1.0},
+    ])
+    assert client.get(f"/ports/{port_id}/observation-anomalies").json() == []
+
+
+def test_observation_anomalies_sorted_ascending(client):
+    port_id = _setup_flat_port(client)
+    # 两个突跳点（02:00 与 05:00），乱序写入；响应按时刻升序
+    _put_observations(client, port_id, [
+        {"obs_time": "2026-09-24T06:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 1.5},
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T04:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T05:00:00Z", "tide_height": 1.5},
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T01:00:00Z", "tide_height": 1.0},
+    ])
+    body = client.get(f"/ports/{port_id}/observation-anomalies").json()
+    assert [a["obs_time"] for a in body] == [
+        "2026-09-24T02:00:00+00:00",
+        "2026-09-24T05:00:00+00:00",
+    ]
+
+
+def test_observation_anomalies_query_is_read_only(client):
+    port_id = _setup_flat_port(client)
+    # 建一个预约，再写入含粗差的实测点；质检后预报、实测点与预约均不变，
+    # /windows 仍按原预报计算（实测点只用于质检与校准查询）
+    rid = client.post(
+        f"/ports/{port_id}/reservations",
+        json={
+            "ship_name": "质检船",
+            "draft": 4.0,
+            "safety_margin": 0.5,
+            "duration_minutes": 60,
+            "allowed_departure_from": "2026-09-24T00:00:00Z",
+            "allowed_departure_to": "2026-09-24T06:00:00Z",
+        },
+    ).json()["id"]
+    observations = [
+        {"obs_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+        {"obs_time": "2026-09-24T01:00:00Z", "tide_height": 1.05},
+        {"obs_time": "2026-09-24T02:00:00Z", "tide_height": 1.5},
+        {"obs_time": "2026-09-24T03:00:00Z", "tide_height": 0.95},
+        {"obs_time": "2026-09-24T04:00:00Z", "tide_height": 1.0},
+    ]
+    _put_observations(client, port_id, observations)
+
+    r = client.get(f"/ports/{port_id}/observation-anomalies")
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+
+    # 实测点原样保留
+    assert client.get(f"/ports/{port_id}/tide-observations").json() == [
+        {"obs_time": o["obs_time"].replace("Z", "+00:00"),
+         "tide_height": o["tide_height"]}
+        for o in observations
+    ]
+    # 预报不变、预约排程不变、水深复核仍达标
+    forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
+    assert [f["tide_height"] for f in forecasts] == [1.0] * 7
+    reservation = client.get(f"/ports/{port_id}/reservations").json()
+    assert [x["id"] for x in reservation] == [rid]
+    assert reservation[0]["departure_start"] == "2026-09-24T00:00:00+00:00"
+    assert client.get(f"/reservations/{rid}/depth-audit").json()["sufficient"] is True
+
+
+def test_observation_anomalies_404_for_unknown_port(client):
+    assert client.get("/ports/999/observation-anomalies").status_code == 404
