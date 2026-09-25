@@ -1,0 +1,571 @@
+# 港口潮汐通航窗口与单向航道预约 API
+
+基于 **Python + FastAPI + SQLite** 的港口潮汐通航窗口计算与单向航道预约服务。
+
+- 录入港口的**潮高预报点**与**航道基准水深**；
+- 船舶提交**吃水**、**安全富余**和**正数通航时长**；
+- 相邻预报点间按**线性插值**求潮高，仅在**预报覆盖时段**内计算
+  `水深 = 基准水深 + 潮高 ≥ 吃水 + 安全富余` 的连续达标窗口（**端点恰好达标也纳入**）；
+- 每个达标窗口的**结束时刻减去通航时长**得到**可出发时段**，不足所需时长的窗口舍弃；
+- 返回**全部可出发时段**和**最早出发时刻**；
+- 预报点更正（同一时刻重复提交即覆盖）后，查询自动按最新数据实时重算；
+- **单向航道预约**：在请求方允许的出发时刻范围内，按最新预报安排**最早**出发时刻，
+  使整个通航过程不与该港口现有**有效预约**重叠（两船**首尾相接允许**）；
+  无可用时刻返回 **409** 且不写入；同港口并发创建原子地“检查 + 落库”，杜绝双重占用；
+- 已落库预约记录的是排定的确定时刻，**预报更正不追溯调整或取消已有预约**；
+- **预约改期**：`PATCH /reservations/{id}/schedule` 只提交**新的允许出发起止时刻**，
+  沿用原预约的吃水、安全富余与通航时长，以**请求时最新预报**重算可出发时段；
+  在同港有效预约中**排除该预约自身原占用**，选出新范围内不与其他占用重叠的
+  **最早**出发时刻（首尾相接允许）；仅**有效**预约可改，排程检查与更新在
+  **同一写事务**内完成；无可行时刻返回 **409** 并**保留原排程与允许范围**；
+  成功时预约 ID、船名与创建时间不变；
+- **预约水深复核**：`GET /reservations/{id}/depth-audit` 按**查询时最新预报**复算
+  预约排定通航区间的水深，合并返回欠深时段及各段**最大欠深**；预报首末点未覆盖
+  整个通航区间时明确返回未覆盖时段且**不判为安全**；复核**只读**，不改动预约或原排程。
+- **最大可通航吃水查询**：`POST /ports/{id}/max-draft` 提交**安全富余**、
+  **正数通航分钟数**与**允许出发起止时刻**，按查询时最新预报与线性插值规则求
+  允许范围内全程水深达标的**最大非负吃水**（按 **0.01 米向下取整**）；同一吃水
+  有多个可行时刻时返回**最早出发**及**通航结束时刻**；只在预报覆盖的连续时段内
+  求解，范围内无可行的 0 米吃水时返回 **409**。
+- **预报影响预演**：`POST /ports/{id}/forecast-impact-preview` 提交一批**拟录入**的
+  潮高预报点，与库存预报按 UTC 规则合并（同一时刻按提交顺序**后者覆盖前者**）形成
+  **临时预报**；基于一次读取的当前预报与该港口**有效预约**，分别用当前与临时预报
+  按线性插值、水深复核规则判定每条预约排定通航区间是否**全程达标**（未被预报覆盖
+  的区间判为不达标）；仅返回**达标状态变化**的预约（按出发时刻升序），预演**只读**，
+  不写入预报、不改动预约。
+- **实测潮位校准窗口**：`PUT /ports/{id}/tide-observations` 批量写入**实测潮高**
+  （同港同一 UTC 时刻重复写入**覆盖旧值**）；`POST /ports/{id}/calibrated-windows`
+  沿用吃水、安全富余、通航时长请求与窗口响应——查询时用**最新预报线性插值**得到
+  观测时刻的预报潮高，**残差 = 实测 − 预报**；仅采用**预报覆盖范围内**的观测，以
+  预报首末时刻的**零残差**为边界锚点（同刻有观测则**观测优先**），锚点间**线性
+  插值残差**并叠加原预报；把预报点与有效观测点时刻合并为折点后**复用现有通航窗口
+  计算**；无有效观测时等同原窗口。校准查询**只读**，不改原预报和预约。
+
+## 快速开始（单条命令）
+
+```bash
+docker compose up --build
+```
+
+该命令自动完成：依赖安装 → SQLite 数据库初始化（服务启动时幂等建表）→ 启动服务。
+
+启动后访问：
+
+- **API 地址**：http://localhost:8000
+- **交互式文档（Swagger UI）**：http://localhost:8000/docs
+- **健康检查**：http://localhost:8000/health
+
+停止：`docker compose down`（加 `-v` 可同时删除数据卷）。
+
+## 配置
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| 服务端口 | `8000` | 修改 `docker-compose.yml` 中 `ports` 左侧的宿主机端口即可 |
+| `DATABASE_PATH` | `/data/tide.db`（容器内）/ `tide.db`（本地） | SQLite 数据库文件路径，通过环境变量配置 |
+| 数据持久化 | 命名卷 `tide-data` → `/data` | 容器重建后数据保留 |
+
+时间约定：所有时刻使用 ISO 8601；不带时区信息时按 **UTC** 处理，响应统一返回 UTC 时刻。
+长度单位为米，时长单位为分钟。
+
+## API 一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/ports` | 录入港口（名称 + 航道基准水深） |
+| `GET` | `/ports` / `/ports/{id}` | 查询港口 |
+| `PATCH` | `/ports/{id}` | 更正港口名称 / 基准水深 |
+| `PUT` | `/ports/{id}/tide-forecasts` | 批量录入/更正潮高预报点（同一时刻重复提交即覆盖） |
+| `GET` | `/ports/{id}/tide-forecasts` | 查看当前预报点 |
+| `PUT` | `/ports/{id}/tide-observations` | 批量写入实测潮高点（同港同一 UTC 时刻重复写入覆盖旧值） |
+| `GET` | `/ports/{id}/tide-observations` | 查看已写入的实测潮高点 |
+| `POST` | `/ports/{id}/windows` | 提交吃水、安全富余、通航时长，计算可出发时段 |
+| `POST` | `/ports/{id}/calibrated-windows` | 实测潮位校准窗口：请求/响应同 `/windows`，按实测残差校准后计算（只读） |
+| `POST` | `/ports/{id}/max-draft` | 提交安全富余、通航时长、允许出发起止，求最大可通航吃水 |
+| `POST` | `/ports/{id}/reservations` | 创建单向航道预约（自动排最早出发时刻） |
+| `GET` | `/ports/{id}/reservations` | 按港口列出**有效**预约（按出发时刻升序） |
+| `DELETE` | `/reservations/{id}` | 取消预约（释放航道占用） |
+| `PATCH` | `/reservations/{id}/schedule` | 预约改期：提交新的允许出发起止，按最新预报重排最早可行时刻 |
+| `GET` | `/reservations/{id}/depth-audit` | 预约水深复核：按最新预报复算排定通航区间水深（只读） |
+| `POST` | `/ports/{id}/forecast-impact-preview` | 预报影响预演：拟录入预报点对有效预约达标状态的影响（只读） |
+
+### 完整示例
+
+```bash
+# 1. 录入港口：航道基准水深 4.5 米
+curl -X POST http://localhost:8000/ports \
+  -H "Content-Type: application/json" \
+  -d '{"name": "示例港", "reference_depth": 4.5}'
+
+# 2. 录入潮高预报点（每 3 小时一个点）
+curl -X PUT http://localhost:8000/ports/1/tide-forecasts \
+  -H "Content-Type: application/json" \
+  -d '{"points": [
+        {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 0.5},
+        {"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 3.0},
+        {"forecast_time": "2026-09-24T06:00:00Z", "tide_height": 0.5}
+      ]}'
+
+# 3. 船舶查询：吃水 5.0 米，安全富余 0.5 米，需要 60 分钟连续通航
+curl -X POST http://localhost:8000/ports/1/windows \
+  -H "Content-Type: application/json" \
+  -d '{"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60}'
+```
+
+响应（所需水深 = 5.0 + 0.5 = 5.5 米；水深 5.0→7.5→5.0，线性插值得达标窗口
+`[00:36, 05:24]`，减去 60 分钟通航时长）：
+
+```json
+{
+  "port_id": 1,
+  "required_depth": 5.5,
+  "duration_minutes": 60.0,
+  "earliest_departure": "2026-09-24T00:36:00+00:00",
+  "windows": [
+    {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
+  ]
+}
+```
+
+```bash
+# 4. 更正 03:00 的预报点（3.0 → 1.0），随后查询自动按最新数据重算
+curl -X PUT http://localhost:8000/ports/1/tide-forecasts \
+  -H "Content-Type: application/json" \
+  -d '{"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]}'
+
+curl -X POST http://localhost:8000/ports/1/windows \
+  -H "Content-Type: application/json" \
+  -d '{"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60}'
+# → {"windows": [], "earliest_departure": null, ...}（峰值水深仅 5.5，窗口长度不足 60 分钟）
+```
+
+### 参数校验
+
+- `duration_minutes` 必须为**正数**（`> 0`），否则返回 422；
+- `draft`、`safety_margin` 必须为非负数；
+- 预报点不足 2 个（无插值区间）或全程不达标时，返回空窗口列表与 `earliest_departure: null`。
+
+## 单向航道预约
+
+创建预约时提交：船名、吃水、安全富余、通航分钟数，以及**允许出发的起止时刻**
+（`allowed_departure_from` ≤ `allowed_departure_to`，含端点；均按上面的 UTC 规则解释）。
+
+排程规则：
+
+1. 基于该港口**最新预报**计算潮汐可出发时段（同 `/windows`）；
+2. 与请求的允许出发范围取交集；
+3. 在其中选择**最早**的出发时刻，使整个通航区间 `[出发, 出发 + 通航时长]`
+   不与该港口任何**有效预约**重叠——两船**首尾相接允许**
+   （上一条 01:00 结束，下一条 01:00 出发合法）；
+4. 无可用时刻返回 **409 Conflict** 且**不写入**任何数据。
+
+同港口并发创建：服务先按港口在进程内串行化，再于 SQLite `BEGIN IMMEDIATE`
+写事务中原子地完成“检查最新预报与现有预约 → 插入”，并设置 `busy_timeout`
+让并发请求排队等待，因此不会产生双重占用。
+
+```bash
+# 沿用上面的示例港：可出发时段 [00:36, 04:24]，甲船申请 00:00–04:24 出发
+curl -X POST http://localhost:8000/ports/1/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"ship_name": "甲船",
+       "draft": 5.0,
+       "safety_margin": 0.5,
+       "duration_minutes": 60,
+       "allowed_departure_from": "2026-09-24T00:00:00Z",
+       "allowed_departure_to":   "2026-09-24T04:24:00Z"}'
+```
+
+响应（`201 Created`；潮汐最早 00:36 可出发，排定 00:36–01:36）：
+
+```json
+{
+  "id": 1,
+  "port_id": 1,
+  "ship_name": "甲船",
+  "draft": 5.0,
+  "safety_margin": 0.5,
+  "duration_minutes": 60.0,
+  "allowed_departure_from": "2026-09-24T00:00:00+00:00",
+  "allowed_departure_to": "2026-09-24T04:24:00+00:00",
+  "departure_start": "2026-09-24T00:36:00+00:00",
+  "departure_end": "2026-09-24T01:36:00+00:00",
+  "status": "active",
+  "created_at": "2026-09-24T10:00:00.000000+00:00",
+  "canceled_at": null
+}
+```
+
+```bash
+# 乙船只允许在 01:30 前出发：01:30 出发会在 [01:30,02:30] 与甲船重叠 → 409
+curl -i -X POST http://localhost:8000/ports/1/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"ship_name": "乙船",
+       "draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60,
+       "allowed_departure_from": "2026-09-24T00:00:00Z",
+       "allowed_departure_to":   "2026-09-24T01:30:00Z"}'
+# HTTP/1.1 409 Conflict
+# {"detail":"允许出发范围内无可用时刻（潮高不足或与现有预约冲突）"}
+
+# 丙船允许到 04:24：最早可紧随甲船 01:36 出发（首尾相接）
+curl -X POST http://localhost:8000/ports/1/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"ship_name": "丙船",
+       "draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60,
+       "allowed_departure_from": "2026-09-24T00:00:00Z",
+       "allowed_departure_to":   "2026-09-24T04:24:00Z"}'
+# → departure_start 01:36，departure_end 02:36
+
+# 列出该港口全部有效预约（已取消的不在其中）
+curl http://localhost:8000/ports/1/reservations
+
+# 取消预约 1：立即释放占用；取消未知预约 404，重复取消 409
+curl -X DELETE http://localhost:8000/reservations/1
+```
+
+说明：
+
+- **预报更正不追溯**：预约创建后即固定 `departure_start/end`；之后更正预报点，
+  已有预约既不会被自动取消，时刻也不会变化（仅影响此后新建预约的排程）；
+- 取消后的预约状态变为 `cancelled`，不再占用航道、不出现在有效列表中；
+- 创建预约的校验与 `/windows` 一致（通航时长为正、吃水/富余非负），
+  此外允许出发范围起止颠倒返回 422，港口不存在返回 404。
+
+## 预约改期
+
+`PATCH /reservations/{id}/schedule` 为已排定的**有效**预约改期：请求体只提供
+**新的允许出发起止时刻**（`allowed_departure_from` ≤ `allowed_departure_to`，
+含端点；均按上面的 UTC 规则解释），吃水、安全富余与通航时长**沿用原预约**。
+
+排程规则与创建预约一致：
+
+1. 以**请求时最新预报**重算潮汐可出发时段；
+2. 同港**有效**预约中**排除该预约自身的原占用**（改期不会与自己冲突），
+   其余占用照常避让（两船**首尾相接允许**）；
+3. 在新允许范围内选出**最早**可行出发时刻，更新允许范围与通航起止；
+4. 排程检查与更新在**同一 SQLite 写事务**内完成（同港先在进程内串行化），
+   并发改期/新建不会产生双重占用；
+5. 新范围内**无可行时刻**返回 **409 Conflict**，且**保留原排程与允许范围**
+   （不改动任何数据）。
+
+成功时预约 **ID、船名、创建时间保持不变**，状态仍为 `active`，返回更新后的
+预约详情；预约不存在返回 404，已取消的预约返回 409，范围起止颠倒返回 422。
+
+```bash
+# 沿用上文示例：丙船（预约 2）排定 01:36–02:36，现改为允许 03:00–04:24 出发
+curl -X PATCH http://localhost:8000/reservations/2/schedule \
+  -H "Content-Type: application/json" \
+  -d '{"allowed_departure_from": "2026-09-24T03:00:00Z",
+       "allowed_departure_to":   "2026-09-24T04:24:00Z"}'
+```
+
+响应（`200 OK`；新范围内最早 03:00 可出发，ID、船名与创建时间不变）：
+
+```json
+{
+  "id": 2,
+  "port_id": 1,
+  "ship_name": "丙船",
+  "draft": 5.0,
+  "safety_margin": 0.5,
+  "duration_minutes": 60.0,
+  "allowed_departure_from": "2026-09-24T03:00:00+00:00",
+  "allowed_departure_to": "2026-09-24T04:24:00+00:00",
+  "departure_start": "2026-09-24T03:00:00+00:00",
+  "departure_end": "2026-09-24T04:00:00+00:00",
+  "status": "active",
+  "created_at": "2026-09-24T10:05:00.000000+00:00",
+  "canceled_at": null
+}
+```
+
+```bash
+# 新范围内无可行时刻（潮高不足或与其他预约冲突）→ 409，原排程与允许范围保留
+curl -i -X PATCH http://localhost:8000/reservations/2/schedule \
+  -H "Content-Type: application/json" \
+  -d '{"allowed_departure_from": "2026-09-25T00:00:00Z",
+       "allowed_departure_to":   "2026-09-25T04:00:00Z"}'
+# HTTP/1.1 409 Conflict
+# {"detail":"新允许出发范围内无可用时刻（潮高不足或与现有预约冲突），已保留原排程"}
+```
+
+## 预约水深复核
+
+`GET /reservations/{id}/depth-audit`（服务默认监听 **8000** 端口）对已排定的预约
+做**只读**水深复核：
+
+- 读取预约排定的通航起止（`departure_start` / `departure_end`）、吃水与安全富余，
+  按该港口**查询时刻的最新预报**相邻点线性插值复算水深；
+- `deficits`：通航区间内水深低于所需水深（吃水 + 安全富余）的连续时段，
+  相邻段已合并，并给出各段**最大欠深**（所需水深 − 时段内最低水深）；
+- 预报首末点未覆盖整个通航区间时，`coverage_complete` 为 `false`，
+  `uncovered` 列出未覆盖时段——这些时段水深未知，**不判为安全**，
+  此时 `sufficient` 一律为 `false`；
+- 结果只反映查询时的预报，**不改动预约或原排程**；预约不存在返回 404，
+  已取消的预约也可复核（`status` 为 `cancelled`）。
+
+```bash
+# 复核预约 1（沿用上文示例：甲船排定 00:36–01:36，所需水深 5.5 米）
+curl http://localhost:8000/reservations/1/depth-audit
+```
+
+预报未变时，排定区间内水深全程达标：
+
+```json
+{
+  "reservation_id": 1,
+  "port_id": 1,
+  "ship_name": "甲船",
+  "status": "active",
+  "departure_start": "2026-09-24T00:36:00+00:00",
+  "departure_end": "2026-09-24T01:36:00+00:00",
+  "draft": 5.0,
+  "safety_margin": 0.5,
+  "required_depth": 5.5,
+  "coverage_complete": true,
+  "uncovered": [],
+  "deficits": [],
+  "sufficient": true
+}
+```
+
+若 03:00 的预报点被更正为 1.0（见上文"完整示例"第 4 步），同一预约复核即
+发现全程欠深（00:36 处欠 0.4 米），但预约本身的排定时刻不受影响：
+
+```json
+{
+  "reservation_id": 1,
+  "port_id": 1,
+  "ship_name": "甲船",
+  "status": "active",
+  "departure_start": "2026-09-24T00:36:00+00:00",
+  "departure_end": "2026-09-24T01:36:00+00:00",
+  "draft": 5.0,
+  "safety_margin": 0.5,
+  "required_depth": 5.5,
+  "coverage_complete": true,
+  "uncovered": [],
+  "deficits": [
+    {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T01:36:00+00:00", "max_deficit": 0.4}
+  ],
+  "sufficient": false
+}
+```
+
+若最新预报只覆盖到 01:00（首末点未覆盖整个通航区间），则返回
+`coverage_complete: false`、`uncovered: [{"start": "…01:00…", "end": "…01:36…"}]`
+且 `sufficient: false`——覆盖不足**不会**被当作安全。
+
+## 最大可通航吃水
+
+`POST /ports/{id}/max-draft`（服务默认监听 **8000** 端口）反求允许出发范围内
+全程水深达标的**最大非负吃水**：
+
+- 提交**安全富余**、**正数通航分钟数**与**允许出发起止时刻**
+  （`allowed_departure_from` ≤ `allowed_departure_to`，含端点；均按 UTC 规则解释）；
+- 按**查询时最新潮高预报**与相邻点线性插值规则，在允许出发范围内寻找
+  `水深 = 基准水深 + 潮高 ≥ 吃水 + 安全富余` 全程成立的最大吃水，
+  结果按 **0.01 米向下取整**；
+- 只在**预报覆盖的连续时段**内求解（不外推）；同一吃水有多个可行时刻时，
+  返回**最早出发时刻**及对应的**通航结束时刻**（出发时刻 + 通航时长）；
+- 允许范围内连 **0 米吃水**都不可行（预报未覆盖、通航时长超过覆盖时段或
+  水深不足）时返回 **409**；查询**只读**，不写库。
+
+```bash
+# 新港口：基准水深 4.0 米，潮高 1.0→3.0→1.0（水深 5.0→7.0→5.0）
+curl -X POST http://localhost:8000/ports \
+  -H "Content-Type: application/json" \
+  -d '{"name": "吃水港", "reference_depth": 4.0}'
+
+curl -X PUT http://localhost:8000/ports/2/tide-forecasts \
+  -H "Content-Type: application/json" \
+  -d '{"points": [
+        {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 1.0},
+        {"forecast_time": "2026-09-24T02:00:00Z", "tide_height": 3.0},
+        {"forecast_time": "2026-09-24T04:00:00Z", "tide_height": 1.0}
+      ]}'
+
+# 安全富余 0.5 米、需要 60 分钟连续通航、允许 00:00–04:00 出发
+curl -X POST http://localhost:8000/ports/2/max-draft \
+  -H "Content-Type: application/json" \
+  -d '{"safety_margin": 0.5,
+       "duration_minutes": 60,
+       "allowed_departure_from": "2026-09-24T00:00:00Z",
+       "allowed_departure_to":   "2026-09-24T04:00:00Z"}'
+```
+
+响应（最优通航区间为以高潮为中心的 01:30–02:30，全程最低水深 6.5 米，
+最大吃水 = 6.5 − 0.5 = 6.0 米）：
+
+```json
+{
+  "port_id": 2,
+  "safety_margin": 0.5,
+  "duration_minutes": 60.0,
+  "allowed_departure_from": "2026-09-24T00:00:00+00:00",
+  "allowed_departure_to": "2026-09-24T04:00:00+00:00",
+  "max_draft": 6.0,
+  "required_depth": 6.5,
+  "departure_start": "2026-09-24T01:30:00+00:00",
+  "departure_end": "2026-09-24T02:30:00+00:00"
+}
+```
+
+```bash
+# 允许出发范围完全落在预报覆盖时段（00:00–04:00）之外：0 米吃水也不可行 → 409
+curl -i -X POST http://localhost:8000/ports/2/max-draft \
+  -H "Content-Type: application/json" \
+  -d '{"safety_margin": 0.5,
+       "duration_minutes": 60,
+       "allowed_departure_from": "2026-09-24T05:00:00Z",
+       "allowed_departure_to":   "2026-09-24T06:00:00Z"}'
+# HTTP/1.1 409 Conflict
+# {"detail":"允许出发范围内无可行的 0 米吃水（预报未覆盖或水深不足）"}
+```
+
+说明：
+
+- 校验与 `/windows` 一致（通航时长为正、安全富余非负），
+  允许出发范围起止颠倒返回 422，港口不存在返回 404；
+- 结果随预报更正实时变化（与 `/windows` 相同，每次查询都按最新预报重算）；
+- 返回的 `departure_start` / `departure_end` 是**取整后**最大吃水下的
+  最早可行出发与通航结束时刻，可直接用于参考排程。
+
+## 预报影响预演
+
+`POST /ports/{id}/forecast-impact-preview`（服务默认监听 **8000** 端口）在
+**不写库**的前提下预演一批拟录入预报点对现有预约的影响：
+
+- 请求体与 `PUT /ports/{id}/tide-forecasts` 相同（`points` 至少 1 个点，
+  时刻按 UTC 规则解释）；拟录入点与库存预报合并形成**临时预报**——
+  同一时刻按提交顺序**后者覆盖前者**（可更正库存点、新增点，
+  同批重复时刻以最后提交的为准）；
+- 基于**一次读取**的当前预报与该港口**有效预约**（已取消的不参与），
+  对每条预约排定的通航区间分别用**当前预报**与**临时预报**按
+  `GET /reservations/{id}/depth-audit` 相同的线性插值、水深复核规则判定
+  是否**全程达标**——欠深或**预报未覆盖**的区间均判为不达标；
+- 仅返回达标状态**发生变化**的预约（`reservation_id`、原达标值
+  `current_sufficient`、预演达标值 `preview_sufficient`），按出发时刻升序；
+  无变化时返回空列表 `[]`；
+- 预演**只读**：不写入预报点、不改动任何预约；港口不存在返回 404。
+
+```bash
+# 沿用上文示例港（基准水深 4.5 米，潮高 0.5→3.0→0.5，
+# 甲船预约排定 2026-09-24 00:36–01:36，所需水深 5.5 米）：
+# 预演“拟把 03:00 的潮高预报从 3.0 更正为 1.0”会影响哪些预约
+curl -X POST http://localhost:8000/ports/1/forecast-impact-preview \
+  -H "Content-Type: application/json" \
+  -d '{"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]}'
+```
+
+响应（预约 1 的通航区间在临时预报下全程欠深，达标状态由达标变为不达标）：
+
+```json
+[
+  {
+    "reservation_id": 1,
+    "current_sufficient": true,
+    "preview_sufficient": false
+  }
+]
+```
+
+预演后库存预报与预约保持不变（可用 `GET /ports/1/tide-forecasts` 与
+`GET /reservations/1/depth-audit` 验证）；若提交的拟录入点不改变任何预约的
+达标状态（例如与当前预报一致），响应为空列表 `[]`。
+
+## 实测潮位校准窗口
+
+潮位站实测数据可对预报做残差校准，用于更贴近实际地评估通航窗口：
+
+- `PUT /ports/{id}/tide-observations`：批量写入实测潮高点
+  （`obs_time` + `tide_height`，时刻按 UTC 规则解释）；**同港同一 UTC 时刻
+  重复写入即覆盖旧值**（与预报点的更正语义一致），可用 `GET
+  /ports/{id}/tide-observations` 查看已写入的实测点；
+- `POST /ports/{id}/calibrated-windows`：**校准窗口查询（只读）**，请求体与
+  窗口响应与 `POST /ports/{id}/windows` **完全一致**
+  （吃水、安全富余、正数通航分钟数；返回 `required_depth`、全部可出发时段
+  `windows` 与 `earliest_departure`）。
+
+校准规则：
+
+1. 查询时读取该港口**最新预报**与全部实测点；对每个观测时刻用相邻预报点
+   **线性插值**得到预报潮高，**残差 = 实测潮高 − 预报潮高**；
+2. **仅采用落在预报覆盖范围 [首预报时刻, 末预报时刻] 内的观测**，范围外的
+   观测忽略（不做外推）；
+3. 以**预报首末时刻的零残差**为边界锚点；边界时刻同刻有观测时**以观测为准**；
+4. 锚点之间对残差做**线性插值**，校准潮高 = 原预报潮高 + 插值残差；
+   观测点处的校准潮高即实测值；
+5. 把**全部预报点时刻与有效观测点时刻合并为折点**（折点之间为线性），再
+   **复用现有通航窗口计算**（同样的达标判定、减通航时长、覆盖不外推规则）；
+6. **无有效观测**（未写入、全部落在覆盖范围外，或预报不足 2 点）时，
+   校准结果与原预报完全一致，响应等同 `/windows`。
+
+校准查询**只读**：不改原预报、不影响已有预约与新预约排程（预约始终按原预报
+计算），实测点仅作用于本接口。
+
+```bash
+# 沿用上文示例港（基准水深 4.5 米，预报潮高 0.5→3.0→0.5，00:00/03:00/06:00）
+# 写入 03:00 的实测潮高 2.0 米（预报 3.0，残差 -1.0 米）
+curl -X PUT http://localhost:8000/ports/1/tide-observations \
+  -H "Content-Type: application/json" \
+  -d '{"points": [{"obs_time": "2026-09-24T03:00:00Z", "tide_height": 2.0}]}'
+# → [{"obs_time": "2026-09-24T03:00:00+00:00", "tide_height": 2.0}]
+
+# 校准窗口查询：校准后水深 5.0→6.5→5.0，所需水深 5.5
+curl -X POST http://localhost:8000/ports/1/calibrated-windows \
+  -H "Content-Type: application/json" \
+  -d '{"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60}'
+```
+
+响应（校准后达标窗口由原 `[00:36, 05:24]` 变为 `[01:00, 05:00]`，
+减去 60 分钟通航时长）：
+
+```json
+{
+  "port_id": 1,
+  "required_depth": 5.5,
+  "duration_minutes": 60.0,
+  "earliest_departure": "2026-09-24T01:00:00+00:00",
+  "windows": [
+    {"start": "2026-09-24T01:00:00+00:00", "end": "2026-09-24T04:00:00+00:00"}
+  ]
+}
+```
+
+```bash
+# 同刻重复写入覆盖旧值；写回与预报一致的 3.0 后，校准窗口等同原窗口
+curl -X PUT http://localhost:8000/ports/1/tide-observations \
+  -H "Content-Type: application/json" \
+  -d '{"points": [{"obs_time": "2026-09-24T03:00:00Z", "tide_height": 3.0}]}'
+```
+
+说明：
+
+- 参数校验与 `/windows` 一致（通航时长为正、吃水/富余非负），
+  实测点列表为空返回 422，港口不存在返回 404；
+- 实测潮高独立于预报存储（`tide_observations` 表），写入实测点不会修改任何
+  预报点；`/windows`、预约排程与水深复核均继续使用原预报；
+- 预报更正后再次查询校准窗口，残差会按**更正后的最新预报**重新计算。
+
+## 本地开发（不用 Docker）
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt   # 运行依赖 + pytest/httpx
+uvicorn app.main:app --reload         # 默认使用 ./tide.db，可用 DATABASE_PATH 覆盖
+pytest                                # 运行全部测试（核心算法 + API 端到端）
+```
+
+## 项目结构
+
+```
+app/
+  main.py       # FastAPI 路由与生命周期（启动时初始化数据库）
+  tides.py      # 核心算法：线性插值、达标窗口、可出发时段、水深复核、最大可通航吃水、预报合并、实测残差校准
+  database.py   # SQLite 连接与幂等建表
+  schemas.py    # Pydantic 请求/响应模型与校验
+tests/
+  test_tides.py # 核心算法单元测试（仅标准库）
+  test_api.py   # API 端到端测试
+Dockerfile / docker-compose.yml / requirements*.txt
+```
